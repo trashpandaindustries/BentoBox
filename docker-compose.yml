@@ -1,0 +1,14 @@
+services:
+  bentobox:
+    container_name: Ratatoskr-BentoBox
+    build: ./BentoBox
+    restart: unless-stopped
+    ports:
+      - ${CLIP_PORT:-3000}:${CLIP_PORT:-3000}
+    env_file:
+      - .env
+    networks:
+      - processor_network  
+
+networks:
+  processor_network:     
