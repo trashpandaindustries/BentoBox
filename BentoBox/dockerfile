@@ -2,5 +2,18 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Persist HF downloads to a cache dir so a mounted volume (see docker-compose.yml)
+# can reuse them across rebuilds/recreations instead of re-downloading every time.
+ENV HF_HOME=/root/.cache/huggingface
+
+# Bake the default model into the image at build time. This layer only
+# invalidates when CLIP_MODEL_ID actually changes, so unrelated code edits
+# don't trigger a re-download, and the container has no runtime dependency
+# on Hugging Face being reachable for the default model.
+ARG CLIP_MODEL_ID=openai/clip-vit-base-patch32
+ENV CLIP_MODEL_ID=${CLIP_MODEL_ID}
+RUN python -c "from transformers import CLIPModel, CLIPProcessor; import os; m = os.environ['CLIP_MODEL_ID']; CLIPModel.from_pretrained(m); CLIPProcessor.from_pretrained(m)"
+
 COPY . .
 CMD ["bentoml", "serve", "service:CLIP", "--port", "3000"]
