@@ -1,9 +1,11 @@
 import os
+import unittest.mock
 import bentoml
 from PIL.Image import Image
 import numpy as np
 from typing import Dict
 from typing import List
+from typing import Optional
 from pydantic import Field
 from fastapi import FastAPI
 
@@ -17,24 +19,48 @@ CORS_ORIGINS = [
 ]
 FORCE_DEVICE = os.getenv("CLIP_FORCE_DEVICE")  # "cpu", "cuda", or unset for auto-detect
 
-# Default zero-shot category list for /classify, overridable per-request.
-CLIP_CATEGORIES = [
-    c.strip()
-    for c in os.getenv(
-        "CLIP_CATEGORIES",
-        "person,animal,vehicle,building,food,landscape,document,artwork"
-    ).split(",")
-    if c.strip()
-]
-# Template used to turn a bare category label into a CLIP-friendly prompt.
-# Must contain a single "{}" placeholder for the category.
-CLIP_CATEGORY_TEMPLATE = os.getenv("CLIP_CATEGORY_TEMPLATE", "a photo of a {}")
+# Florence-2 is opt-in: it's only needed at ingestion time, not on the hot path
+# that CLIP serves routinely, so it's kept out of memory entirely unless enabled.
+FLORENCE_ENABLED = os.getenv("FLORENCE_ENABLED", "false").strip().lower() == "true"
+FLORENCE_MODEL_ID = os.getenv("FLORENCE_MODEL_ID", "microsoft/Florence-2-base")
+# Strongly recommended once FLORENCE_ENABLED=true: Florence-2 requires
+# trust_remote_code=True, which executes code shipped in the HF repo, not just
+# weights. Pin this to a known-good commit hash rather than trusting `main`.
+FLORENCE_MODEL_REVISION = os.getenv("FLORENCE_MODEL_REVISION") or None
+
+CAPTION_TASKS = {
+    "brief": "<CAPTION>",
+    "detailed": "<DETAILED_CAPTION>",
+    "very_detailed": "<MORE_DETAILED_CAPTION>",
+}
 
 runtime_image = bentoml.images.Image(
     python_version="3.11"
 ).requirements_file("requirements.txt")
 
+if FLORENCE_ENABLED:
+    from transformers.dynamic_module_utils import get_imports as _ORIGINAL_GET_IMPORTS
+
 system_app = FastAPI()
+
+
+def _patched_get_imports(filename):
+    """
+    Florence-2's remote modeling code unconditionally imports flash_attn even
+    when it isn't needed (e.g. CPU inference, or attn_implementation="sdpa"),
+    which raises ImportError on any machine without flash-attn installed.
+    This is a well-known community workaround: strip flash_attn out of the
+    detected imports for that one file before transformers tries to load it.
+
+    _ORIGINAL_GET_IMPORTS is captured at module load time, before the
+    unittest.mock.patch call below replaces the module attribute — resolving
+    it lazily inside this function instead would just call this same patched
+    function again (infinite recursion).
+    """
+    imports = _ORIGINAL_GET_IMPORTS(filename)
+    if str(filename).endswith("modeling_florence2.py"):
+        imports = [i for i in imports if i != "flash_attn"]
+    return imports
 
 
 @bentoml.service(
@@ -55,6 +81,14 @@ class CLIP:
 
     hf_model = bentoml.models.HuggingFaceModel(MODEL_ID)
 
+    # Only declared as a BentoML model dependency when enabled - if
+    # FLORENCE_ENABLED is false this attribute doesn't exist, so BentoML never
+    # attempts to resolve or download it.
+    if FLORENCE_ENABLED:
+        florence_hf_model = bentoml.models.HuggingFaceModel(
+            FLORENCE_MODEL_ID, revision=FLORENCE_MODEL_REVISION
+        )
+
     def __init__(self) -> None:
         import torch
         from transformers import CLIPModel, CLIPProcessor
@@ -65,88 +99,38 @@ class CLIP:
         self.clip_model = CLIPModel.from_pretrained(self.hf_model).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(self.hf_model)
         self.logit_scale = self.clip_model.logit_scale.item() if self.clip_model.logit_scale.item() else 4.60517
-        # Flipped true once the model is loaded and usable; used by /healthz
-        # so liveness checks don't need to run inference to be meaningful.
-        self.ready = True
         print("Model clip loaded", "device:", self.device, "model:", MODEL_ID)
 
-    # -----------------------------------------------------------------
-    # Public, HTTP-facing endpoints (@bentoml.api). These should only ever
-    # be called from outside the class (over HTTP). Calling one of these
-    # directly from another method on this class routes through BentoML's
-    # internal client/proxy layer and can break (e.g. it tries to
-    # re-serialize PIL Images as multipart file uploads). Cross-method
-    # calls within the class must go through the plain "_impl" methods
-    # below instead.
-    # -----------------------------------------------------------------
+        self.florence_enabled = FLORENCE_ENABLED
+        self.florence_model_id = FLORENCE_MODEL_ID
+        if self.florence_enabled:
+            self._load_florence()
+
+    def _load_florence(self) -> None:
+        from transformers import AutoModelForCausalLM, AutoProcessor
+
+        with unittest.mock.patch(
+            "transformers.dynamic_module_utils.get_imports", _patched_get_imports
+        ):
+            self.florence_model = AutoModelForCausalLM.from_pretrained(
+                self.florence_hf_model,
+                trust_remote_code=True,
+                attn_implementation="sdpa",
+            ).to(self.device)
+            self.florence_processor = AutoProcessor.from_pretrained(
+                self.florence_hf_model, trust_remote_code=True
+            )
+        print(
+            "Model florence loaded", "device:", self.device,
+            "model:", self.florence_model_id,
+            "revision:", FLORENCE_MODEL_REVISION or "unpinned (main)",
+        )
 
     @bentoml.api(batchable=True)
     async def encode_image(self, items: List[Image]) -> np.ndarray:
         '''
         generate the embeddings of the images
         '''
-        return await self._encode_image_impl(items)
-
-    @bentoml.api(batchable=True)
-    async def encode_text(self, items: List[str]) -> np.ndarray:
-        '''
-        generate the embeddings of the texts
-        '''
-        return await self._encode_text_impl(items)
-
-    @bentoml.api
-    async def rank(self, queries: List[Image], candidates : List[str] = Field(["picture of a dog", "picture of a cat"], description="list of description candidates")) -> Dict[str, List[List[float]]]:
-        '''
-        return the similarity between the query images and the candidate texts
-        '''
-        return await self._rank_impl(queries, candidates)
-
-    @bentoml.api
-    async def classify(
-        self,
-        items: List[Image],
-        categories: List[str] = Field(
-            default_factory=list,
-            description="Category labels to classify against. Leave empty to use the server's CLIP_CATEGORIES env config; pass your own list to override per-request.",
-        ),
-        template: str = Field(
-            "",
-            description="Prompt template used to turn each category label into a CLIP text prompt. Must contain one '{}' placeholder. Leave empty to use the server's CLIP_CATEGORY_TEMPLATE env config.",
-        ),
-        top_k: int = Field(3, description="Number of top-scoring categories to return per image."),
-    ) -> Dict[str, List]:
-        '''
-        Zero-shot classify images against a category list (env-configured default,
-        or a caller-supplied list/template for one-off use).
-        '''
-        categories = categories or list(CLIP_CATEGORIES)
-        template = template or CLIP_CATEGORY_TEMPLATE
-
-        if "{}" not in template:
-            raise ValueError("template must contain a single '{}' placeholder for the category label")
-        if not categories:
-            raise ValueError("categories must be a non-empty list")
-
-        prompts = [template.format(c) for c in categories]
-        result = await self._rank_impl(items, prompts)
-        probs = np.array(result["probabilities"])
-        k = min(top_k, len(categories))
-
-        predictions = [
-            [
-                {"label": categories[i], "score": float(row[i])}
-                for i in np.argsort(row)[::-1][:k]
-            ]
-            for row in probs
-        ]
-        return {"predictions": predictions}
-
-    # -----------------------------------------------------------------
-    # Internal implementations. Plain async methods (no @bentoml.api),
-    # safe to call directly from other methods on this class.
-    # -----------------------------------------------------------------
-
-    async def _encode_image_impl(self, items: List[Image]) -> np.ndarray:
         # Resizing is intentionally left to CLIPProcessor, which resizes/crops
         # to whatever size the loaded model's own preprocessor config specifies.
         # Do not hardcode target dimensions here — CLIP_MODEL_ID can point at
@@ -154,16 +138,26 @@ class CLIP:
         inputs = self.processor(images=items, return_tensors="pt", padding=True).to(self.device)
         image_embeddings = self.clip_model.get_image_features(**inputs)
         return image_embeddings.cpu().detach().numpy()
+    
 
-    async def _encode_text_impl(self, items: List[str]) -> np.ndarray:
+    @bentoml.api(batchable=True)
+    async def encode_text(self, items: List[str]) -> np.ndarray:
+        '''
+        generate the embeddings of the texts
+        '''
         inputs = self.processor(text=items, return_tensors="pt", padding=True).to(self.device)
         text_embeddings = self.clip_model.get_text_features(**inputs)
         return text_embeddings.cpu().detach().numpy()
+    
+    @bentoml.api
+    async def rank(self, queries: List[Image], candidates : List[str] = Field(["picture of a dog", "picture of a cat"], description="list of description candidates")) -> Dict[str, List[List[float]]]:
+        '''
+        return the similarity between the query images and the candidate texts
+        '''
 
-    async def _rank_impl(self, queries: List[Image], candidates: List[str]) -> Dict[str, List[List[float]]]:
         # Encode embeddings
-        query_embeds = await self._encode_image_impl(queries)
-        candidate_embeds = await self._encode_text_impl(candidates)
+        query_embeds = await self.encode_image(queries)
+        candidate_embeds = await self.encode_text(candidates)
 
         # Compute cosine similarities
         cosine_similarities = self.cosine_similarity(query_embeds, candidate_embeds)
@@ -173,6 +167,52 @@ class CLIP:
         return {
             "probabilities": prob_scores.tolist(),
             "cosine_similarities" : cosine_similarities.tolist(),
+        }
+
+    @bentoml.api
+    async def caption(
+        self,
+        image: Image,
+        detail: str = Field(
+            "detailed",
+            description="Caption granularity: 'brief', 'detailed', or 'very_detailed'",
+        ),
+    ) -> Dict[str, str]:
+        '''
+        generate a natural-language caption for an image via Florence-2.
+        Intended for ingestion-time use, not routine/hot-path calls.
+        '''
+        return await self._caption_impl(image, detail)
+
+    async def _caption_impl(self, image: Image, detail: str) -> Dict[str, str]:
+        if not self.florence_enabled:
+            raise bentoml.exceptions.BentoMLException(
+                "Florence-2 captioning is disabled on this instance. "
+                "Set FLORENCE_ENABLED=true and restart to enable it."
+            )
+
+        task_prompt = CAPTION_TASKS.get(detail, CAPTION_TASKS["detailed"])
+
+        inputs = self.florence_processor(
+            text=task_prompt, images=image, return_tensors="pt"
+        ).to(self.device)
+        generated_ids = self.florence_model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            num_beams=3,
+            do_sample=False,
+        )
+        generated_text = self.florence_processor.batch_decode(
+            generated_ids, skip_special_tokens=False
+        )[0]
+        parsed = self.florence_processor.post_process_generation(
+            generated_text, task=task_prompt, image_size=(image.width, image.height)
+        )
+        return {
+            "detail": detail,
+            "task_prompt": task_prompt,
+            "caption": parsed[task_prompt],
         }
 
     @staticmethod
@@ -185,7 +225,7 @@ class CLIP:
         cosine_similarities = np.matmul(query_embeds, candidates_embeds.T)
 
         return cosine_similarities
-
+    
     @staticmethod
     def softmax(scores):
         # Compute softmax scores (probabilities)
@@ -203,30 +243,23 @@ class CLIP:
             "embedding_dimension": self.clip_model.config.projection_dim,  # 512, but derived not hardcoded
             "device": self.device,
             "model_revision": getattr(self.hf_model, "revision", None) or "unknown",
+            "florence_enabled": self.florence_enabled,
+            "florence_model_id": self.florence_model_id if self.florence_enabled else None,
+            "florence_model_revision": (
+                (FLORENCE_MODEL_REVISION or "unpinned (main)")
+                if self.florence_enabled else None
+            ),
         }
-
-    @system_app.get("/healthz")
-    async def healthz(self) -> Dict:
-        '''
-        Cheap liveness check: process is up and the model finished loading.
-        No inference is run — safe to poll frequently (e.g. every few seconds
-        from a load balancer or orchestrator).
-        '''
-        if getattr(self, "ready", False):
-            return {"status": "ok", "device": self.device}
-        return {"status": "loading"}
 
     @system_app.get("/health")
     async def health(self) -> Dict:
-        '''
-        Readiness check: runs a real inference pass to confirm the model is
-        actually usable, not just loaded. Heavier than /healthz — use for
-        readiness probes, not tight polling loops.
-        '''
         try:
             _ = self.clip_model.get_text_features(
                 **self.processor(text=["health check"], return_tensors="pt", padding=True).to(self.device)
             )
-            return {"status": "ok", "device": self.device}
+            status = {"status": "ok", "device": self.device, "florence_enabled": self.florence_enabled}
+            if self.florence_enabled:
+                status["florence_status"] = "loaded" if hasattr(self, "florence_model") else "not_loaded"
+            return status
         except Exception as e:
             return {"status": "error", "detail": str(e)}
