@@ -3,3 +3,7 @@ pillow==10.3.0
 torch==2.3.1
 transformers==4.41.2
 fastapi[standard]==0.136.1
+# Florence-2 dependencies (only exercised when FLORENCE_ENABLED=true, but
+# installed unconditionally so switching the env var doesn't require a rebuild)
+einops==0.8.0
+timm==0.9.16
